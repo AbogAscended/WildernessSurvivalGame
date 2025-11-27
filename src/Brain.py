@@ -1,3 +1,6 @@
+import Player
+import Vision
+
 class Brain:
     player_reference = None
     vision_reference = None
