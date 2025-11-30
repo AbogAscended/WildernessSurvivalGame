@@ -3,13 +3,22 @@ import Items, Trader
 class Player:
     maxFood = maxWater = maxStrength = 0
     currentGold = currentWater = currentFood = 0
+    position = (0, 0)
+    map_reference = None
 
     def __init__(self):
+        self.reset()
+    
+    def reset(self):
         # global maxWater, maxFood, maxStrength, currentGold, currentWater, currentFood
         self.maxFood = self.maxWater = self.maxStrength = 100
         self.currentGold = 20
         self.currentWater = 10
         self.currentFood = 10
+        self.position = (0, 0)
+
+    def attach_map(self, new_map):
+        map_reference = new_map
     
     def bargain(trader): # returns 1 for sucessful trade, 0 for unsucessful
         bargaining = True

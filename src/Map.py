@@ -40,3 +40,6 @@ class Map:
 
     def __init__(self, width, height, player, difficulty):
         self.reset(width, height, player, difficulty)
+
+    def getTile(self, x, y):
+        return self.tile_map[x][y]
