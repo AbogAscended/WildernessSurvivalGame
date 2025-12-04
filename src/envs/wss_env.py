@@ -350,6 +350,7 @@ class WildernessSurvivalEnv(gym.Env):
                     f_half = math.ceil(f_cost / 2)
                     self.player.currentWater = max(0, self.player.currentWater - w_half)
                     self.player.currentFood = max(0, self.player.currentFood - f_half)
+                    self.player.currentStrength = max(0, min(self.player.maxStrength, self.player.currentStrength + 5))
                     water_used += w_half
                     food_used += f_half
             else:
@@ -360,6 +361,7 @@ class WildernessSurvivalEnv(gym.Env):
                 f_half = math.ceil(f_cost / 2)
                 self.player.currentWater = max(0, self.player.currentWater - w_half)
                 self.player.currentFood = max(0, self.player.currentFood - f_half)
+                self.player.currentStrength = max(0, min(self.player.maxStrength, self.player.currentStrength + 5))
                 water_used += w_half
                 food_used += f_half
 
@@ -382,8 +384,8 @@ class WildernessSurvivalEnv(gym.Env):
         w_east = 1.0   # Increased from 0.5 to encourage forward progress more
         w_surv = 0.5   # Increased from 0.3 to emphasize resource maintenance
         w_disc = 0.5   # Increased from 0.2 to reward exploration
-        w_gold = 0.001 # Reduced from 0.01 to prevent infinite reward loops via trading
-        w_time = 0.005  # Reduced from 0.01 to allow more exploration time
+        w_gold = 0.000 # Reduced from 0.01 to prevent infinite reward loops via trading
+        w_time = 0.000  # Reduced from 0.01 to allow more exploration time
 
         # Read hardness if available (0..1). Scale rewards mildly by difficulty.
         try:

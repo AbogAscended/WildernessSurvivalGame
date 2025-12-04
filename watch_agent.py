@@ -23,7 +23,7 @@ def parse_args():
     p.add_argument('--device', type=str, default=None)
     p.add_argument('--ascii-colors', action='store_true')
     p.add_argument('--clear-screen', action='store_true')
-    p.add_argument('--render-mode', type=str, default='human', choices=['human', 'pygame', 'rgb_array'])
+    p.add_argument('--render-mode', type=str, default='pygame', choices=['human', 'pygame', 'rgb_array'])
     p.add_argument('--episodes', type=int, default=1, help='Number of episodes to watch.')
     return p.parse_args()
 

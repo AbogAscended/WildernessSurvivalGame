@@ -41,6 +41,7 @@ if str(ROOT) not in sys.path:
 from src.envs.wss_env import WildernessSurvivalEnv
 from src.envs.wss_vec_env import WSSNativeVecEnv
 from src import Difficulty
+from src.wss_obs_utils import encode_wss_obs_numpy
 import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.vector import SyncVectorEnv, AsyncVectorEnv
@@ -77,26 +78,13 @@ class WSSObservationWrapper(gym.ObservationWrapper):
         self.env.difficulty = value
 
     def observation(self, obs):
-        # 1. Terrain One-Hot
-        t = obs["terrain"].flatten()  # (121,)
-        t_oh = np.eye(6)[t].flatten() # (726,)
-
-        # 2. Items One-Hot
-        i = obs["items"].flatten()    # (121,)
-        i_oh = np.eye(5)[i].flatten() # (605,)
-
-        # 3. Status (Normalized)
-        s = obs["status"].astype(np.float32) / 100.0
-
-        # 4. Trader (Scaled)
-        tr = obs["trader"].flatten().astype(np.float32) * 0.1
-
-        # 5. Prev Action (One-Hot)
-        # prev_action is (1,) int
-        pa = obs["prev_action"].item()
-        pa_oh = np.eye(13)[pa].flatten()
-
-        return np.concatenate([t_oh, i_oh, s, tr, pa_oh])
+        return encode_wss_obs_numpy(
+            obs["terrain"],
+            obs["items"],
+            obs["status"],
+            obs["trader"],
+            obs["prev_action"].item()
+        )
 
 
 def create_wrapped_env(width, height, difficulty, render_mode, env_kwargs):

@@ -5,6 +5,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from src import Difficulty
+from src.wss_obs_utils import encode_wss_obs_torch
 
 class WSSNativeVecEnv(gym.vector.VectorEnv):
     """
@@ -17,7 +18,7 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         num_envs,
         width=None,
         height=None,
-        difficulty="easy",
+        difficulty="medium",
         device="cuda",
         render_mode=None,
         window_radius=2,
@@ -27,14 +28,20 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
     ):
         self.num_envs = num_envs
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.difficulty = difficulty
+        
+        # Canonicalize difficulty
+        if Difficulty:
+            self.difficulty = Difficulty.canonicalize(difficulty)
+        else:
+            self.difficulty = difficulty
+            
         self.gamma = gamma
         self.window_radius = window_radius
         self.max_steps = max_steps
         
         w_range = (20, 20)
         if Difficulty:
-            w_range = Difficulty.MAP_SIZES.get(difficulty, (20, 20))
+            w_range = Difficulty.MAP_SIZES.get(self.difficulty, (20, 20))
 
         max_side = 110
         if Difficulty:
@@ -117,16 +124,16 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         # Config
         self.max_food = 100
         self.max_water = 100
-        self.start_food = 100
-        self.start_water = 100
-        self.start_gold = 0
+        self.start_food = 20
+        self.start_water = 20
+        self.start_gold = 20
         self.start_strength = 100
         self.max_strength = 100
-        
+
         # Fog mask (pre-computed for window)
         self.vis_radius = 3
         if Difficulty:
-            self.vis_radius = Difficulty.VISION_RADII.get(difficulty, 3)
+            self.vis_radius = Difficulty.VISION_RADII.get(self.difficulty, 3)
             
         # Initialize
         self.reset_all()
@@ -148,47 +155,15 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
     def set_attr(self, name, value):
         if name == "difficulty":
             self.difficulty = value
+            if Difficulty:
+                 self.difficulty = Difficulty.canonicalize(value)
         else:
             setattr(self, name, value)
 
     def _generate_maps(self, env_indices):
         if len(env_indices) == 0: return
-
-        # Mixing Probs for Curriculum
-        # Easy: 100% Easy
-        # Medium: 95% Med, 5% Easy
-        # Hard: 90% Hard, 5% Med, 5% Easy
-        # Extreme: 100% Extreme (or mix?) -> User didn't specify, use 100% Extreme for safety.
-        
-        probs = {
-            "easy": [1.0, 0.0, 0.0, 0.0], # E, M, H, Ex
-            "medium": [0.05, 0.95, 0.0, 0.0],
-            "hard": [0.05, 0.05, 0.90, 0.0],
-            "extreme": [0.05, 0.05, 0.10, 0.80],
-        }
-        # Map diff string to index
-        diff_names = ["easy", "medium", "hard", "extreme"]
-        
-        current = self.difficulty
-        
-        # Handle unknown difficulty gracefully (e.g. 'normal')
-        if current not in probs:
-             self._generate_maps_from_config(env_indices, current)
-             return
-
-        # Sample difficulties
-        p = torch.tensor(probs[current], device=self.device)
-        n = len(env_indices)
-        
-        # Sample indices (0=Easy, 1=Medium, 2=Hard, 3=Extreme)
-        sampled_indices = torch.multinomial(p, n, replacement=True)
-        
-        # Dispatch by group
-        for i, name in enumerate(diff_names):
-            mask = (sampled_indices == i)
-            if mask.any():
-                group_indices = env_indices[mask]
-                self._generate_maps_from_config(group_indices, name)
+        # Always use canonical difficulty
+        self._generate_maps_from_config(env_indices, self.difficulty)
 
     def _generate_maps_from_config(self,
                                    env_indices,
@@ -280,6 +255,32 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         mask_g = items == 4
         amounts[mask_g] = rand_amt(mask_g, *g_amt)
         # Gold never repeats
+        
+        # Scaling based on tile costs (Match Sync Env)
+        buffer = 5
+        if difficulty in ["hard", "extreme"]:
+            buffer = 2
+
+        # Get terrain costs for scaling
+        curr_t = self.map_terrain[env_indices].long() # (N, H, W)
+        curr_t_flat = curr_t.view(-1)
+        curr_c_flat = self.terrain_costs[curr_t_flat] # (N*H*W, 3)
+        curr_c = curr_c_flat.view(n, self.height, self.width, 3)
+
+        w_costs = curr_c[..., 1]
+        f_costs = curr_c[..., 2]
+
+        # Water Scaling
+        mask_w = (items == 2)
+        needed_w = (w_costs + buffer).int()
+        scaled_w = torch.maximum(amounts.int(), needed_w)
+        amounts = torch.where(mask_w, scaled_w.to(torch.int16), amounts)
+
+        # Food Scaling
+        mask_f = (items == 3)
+        needed_f = (f_costs + buffer).int()
+        scaled_f = torch.maximum(amounts.int(), needed_f)
+        amounts = torch.where(mask_f, scaled_f.to(torch.int16), amounts)
         
         self.map_item_amounts[env_indices] = amounts
         self.map_item_repeat[env_indices] = repeats
@@ -408,9 +409,8 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         # curr_y = self.player_pos[:, 1]
         phi_e_before = curr_x.float() / (self.env_width - 1).float()
 
-        # 1. Calculate Next Pos
+        # 1. Calculate Next Pos & Passability
         # direction deltas
-        # clamp actions to 0-12
         move_mask = actions < 9
         trade_mask = actions >= 9
         
@@ -430,42 +430,34 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         next_x = torch.min(next_x, self.env_width - 1)
         next_y = torch.min(next_y, self.env_height - 1)
 
-        # 2. Terrain Costs
-        # Get terrain type at next_x, next_y
-        # Indexing: (N, y, x)
+        # Terrain Costs (Check Passability on Target Tile)
         t_types = self.map_terrain[torch.arange(n), next_y, next_x].long() # (N,)
         costs = self.terrain_costs[t_types] # (N, 3) -> Move, Water, Food
         
         c_str = costs[:, 0]
         c_wat = costs[:, 1]
         c_fod = costs[:, 2]
+
+        # Match WildernessSurvivalEnv: strength >= m and water >= w and food >= f
+        curr_f = self.player_status[:, 0]
+        curr_w = self.player_status[:, 1]
+        curr_s = self.player_status[:, 2]
         
-        # If stay (action 0), costs are halved, strength +2
-        stay_mask = (actions == 0)
-        c_wat = torch.where(stay_mask, (c_wat + 1) // 2, c_wat)
-        c_fod = torch.where(stay_mask, (c_fod + 1) // 2, c_fod)
-        d_str = -c_str
-        d_str[stay_mask] = 2
+        can_enter = (curr_s >= c_str.int()) & (curr_w >= c_wat.int()) & (curr_f >= c_fod.int())
         
-        # Apply Costs
-        self.player_status[:, 1] -= c_wat.int()
-        self.player_status[:, 0] -= c_fod.int()
-        self.player_status[:, 2] += d_str.int()
+        # Identify blocked moves (attempted move but cannot enter)
+        blocked = move_mask & (~can_enter)
         
-        # Update Position (only if move action)
+        # Update move_mask to exclude blocked moves
+        move_mask = move_mask & can_enter
+        
+        # 2. Update Position (only if move action & not blocked)
         # Trade actions don't move
         self.player_pos[:, 0] = torch.where(move_mask, next_x, curr_x)
         self.player_pos[:, 1] = torch.where(move_mask, next_y, curr_y)
         
-        # 3. Item Collection (only on Move/Stay)
-        # Logic: If entering tile, collect items.
-        # Priority: Trader > Gold > Water > Food
-        
-        # Current tile items
+        # 3. Item Collection (at new position)
         px, py = self.player_pos[:, 0], self.player_pos[:, 1]
-        # We access items at the NEW position
-        
-        # Get item info
         i_type = self.map_items[torch.arange(n), py, px] # (N,)
         i_amt = self.map_item_amounts[torch.arange(n), py, px]
         i_rep = self.map_item_repeat[torch.arange(n), py, px]
@@ -480,11 +472,9 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         self.player_status[:, 0] += (has_food * i_amt).int()
         self.player_status[:, 3] += (has_gold * i_amt).int()
         
-        # Clear items if not repeating
-        # Only clear if we collected (i.e. type > 1)
+        # Clear items if not repeating (and collected)
         collected = (i_type > 1)
         should_clear = collected & (~i_rep)
-
         clear_idx = torch.nonzero(should_clear).squeeze(1)
         if clear_idx.numel() > 0:
             self.map_items[clear_idx, py[clear_idx], px[clear_idx]] = 0
@@ -492,39 +482,85 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
             
         # 4. Trade Actions
         # Actions 9-12 correspond to proposals 0-3
-        # Only valid if on trader tile
-        # If valid, apply deltas.
-        
+        # Only valid if on trader tile AND afford payment
         t_idx = actions - 9
         is_trade_action = (actions >= 9)
-        valid_trade = is_trade_action & has_trader
+        valid_trade_loc = is_trade_action & has_trader
         
-        if valid_trade.any():
-            idx = torch.nonzero(valid_trade).squeeze(1)
-            # Get proposals
-            # (N, 4, 4)
+        if valid_trade_loc.any():
+            idx = torch.nonzero(valid_trade_loc).squeeze(1)
             props = self.map_trader_deltas[idx, py[idx], px[idx]] # (K, 4, 4)
-            # Select specific proposal
-            # t_idx[idx] gives 0-3
-            # gather or simple indexing
             sel_prop = props[torch.arange(len(idx), device=self.device), t_idx[idx]] # (K, 4) -> [dF, dW, dS, dG]
             
-            # Apply to status
-            # Status: F, W, S, G
-            # Proposal: F, W, S, G
-            self.player_status[idx] += sel_prop.int()
+            # Check Affordability
+            # sel_prop has negative values for payment. current + delta >= 0
+            # We check Food, Water, Gold (indices 0, 1, 3 in status)
+            # dF=0, dW=1, dS=2, dG=3 in sel_prop?
+            # map_trader_deltas constructed as: [Food, Water, Strength, Gold]
+            # player_status: [Food, Water, Strength, Gold]
+            # So indices match.
             
+            curr_vals = self.player_status[idx]
+            new_vals = curr_vals + sel_prop.int()
+            
+            # Check non-negative resources (Strength usually 0 delta, so ignore check or check it too)
+            can_afford = (new_vals[:, 0] >= 0) & (new_vals[:, 1] >= 0) & (new_vals[:, 3] >= 0)
+            
+            # Apply only where affordable
+            valid_idx = idx[can_afford]
+            if valid_idx.numel() > 0:
+                # Re-select props for valid subset
+                # Or just mask
+                # We can use scatter add or just indexed assignment if we are careful
+                # Let's use the computed new_vals for valid ones
+                self.player_status[valid_idx] += sel_prop[can_afford].int()
+
+        # 5. Apply Step Costs (Move/Stay/ForceStay)
+        # If stay (action 0) OR blocked OR trade action, costs are based on CURRENT tile (halved), strength +5
+        stay_mask = (actions == 0)
+        force_stay = stay_mask | blocked | trade_mask
+        
+        # For force_stay, we need costs of CURRENT tile.
+        # Since we already updated pos, if we moved, we are at new tile.
+        # If we were blocked/stay/trade, pos didn't change.
+        # So we can just look at player_pos.
+        curr_t_types = self.map_terrain[torch.arange(n), py, px].long()
+        curr_costs = self.terrain_costs[curr_t_types]
+        curr_c_str = curr_costs[:, 0]
+        curr_c_wat = curr_costs[:, 1]
+        curr_c_fod = curr_costs[:, 2]
+        
+        stay_wat = (curr_c_wat + 1) // 2
+        stay_fod = (curr_c_fod + 1) // 2
+        
+        # If force_stay: use stay costs. Else: use move costs (from step 1 calculation)
+        # Wait, move costs depended on NEXT tile (which is now Current tile if we moved).
+        # So actually, if we moved, 'curr_costs' IS the move cost (entering new tile).
+        # So we can use 'curr_costs' for everything?
+        # Sync Env:
+        # Move -> Cost is full tile cost of entered tile.
+        # Stay/Blocked -> Cost is half tile cost of current tile.
+        # So yes, always based on the tile at player_pos (after move).
+        
+        final_c_wat = torch.where(force_stay, stay_wat, curr_c_wat)
+        final_c_fod = torch.where(force_stay, stay_fod, curr_c_fod)
+        
+        # Strength: if force_stay, +5. Else -cost.
+        d_str = -curr_c_str
+        d_str = torch.where(force_stay, torch.tensor(5, device=self.device, dtype=torch.int16), d_str)
+        
+        self.player_status[:, 1] -= final_c_wat.int()
+        self.player_status[:, 0] -= final_c_fod.int()
+        self.player_status[:, 2] += d_str.int()
+
         # Clamp stats
         self.player_status[:, 0] = torch.clamp(self.player_status[:, 0], 0, self.max_food)
         self.player_status[:, 1] = torch.clamp(self.player_status[:, 1], 0, self.max_water)
-        self.player_status[:, 2] = torch.clamp(self.player_status[:, 2], 0, 1000) # No strict max strength?
+        self.player_status[:, 2] = torch.clamp(self.player_status[:, 2], 0, self.max_strength) # Clamped to max_strength
         
-        # 5. Termination & Reward
-        # Terminated: East Edge (px == W-1) or Dead (Food<=0 or Water<=0)
-        # Truncated: Max steps
-        
+        # 6. Termination & Reward
         reached_goal = (self.player_pos[:, 0] == self.env_width - 1)
-        dead = (self.player_status[:, 0] <= 0) | (self.player_status[:, 1] <= 0) | (self.player_status[:, 2] <= 0)
+        dead = (self.player_status[:, 0] <= 0) | (self.player_status[:, 1] <= 0)
         
         self.steps += 1
         truncated = torch.zeros(n, device=self.device, dtype=torch.bool)
@@ -551,15 +587,16 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         w_east = 1.0
         w_surv = 0.5
         w_disc = 0.5
-        w_gold = 0.001
-        w_time = 0.005
+        w_gold = 0.000
+        w_time = 0.000
         
-        # Hardness Scaling
+        # Hardness Scaling (Canonical)
         hardness = 0.0
-        if self.difficulty == 'medium': hardness = 0.33
-        elif self.difficulty == 'hard': hardness = 0.66
-        elif self.difficulty == 'extreme': hardness = 1.0
-        elif self.difficulty == 'easy': hardness = 0.0
+        if Difficulty:
+            try:
+                hardness = Difficulty.get_hardness(self.difficulty)
+            except:
+                pass
         
         w_goal *= (1.0 + 0.5 * hardness)
         w_east *= (1.0 + 0.25 * hardness)
@@ -638,8 +675,6 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         px = self.player_pos[:, 0]
         py = self.player_pos[:, 1]
         
-        pad = 5
-        
         # Create padded maps
         padded_terrain = torch.zeros((n, self.height + 10, self.width + 10), device=self.device, dtype=torch.int8)
         
@@ -674,10 +709,6 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         t_win = t_win.clone()
         t_win[:, fog_mask] = 0 # Set to Fog
         
-        # One-hot Terrain (0..5) -> 6 channels
-        t_oh = torch.nn.functional.one_hot(t_win.long(), num_classes=6) # (N, 11, 11, 6)
-        t_flat = t_oh.view(n, -1).float()
-        
         # Items
         # Map items: 0..4.
         padded_items = torch.zeros((n, self.height + 10, self.width + 10), device=self.device, dtype=torch.int8)
@@ -686,26 +717,20 @@ class WSSNativeVecEnv(gym.vector.VectorEnv):
         i_win = padded_items[batch_idx, idx_y, idx_x]
         i_win[:, fog_mask] = 0
         
-        i_oh = torch.nn.functional.one_hot(i_win.long(), num_classes=5) # (N, 11, 11, 5)
-        i_flat = i_oh.view(n, -1).float()
-        
-        # Status
-        s_flat = self.player_status.float() / 100.0
-        
+        # Trader
         has_trader = (self.map_items[torch.arange(n), py, px] == 1)
         
-        tr_flat = torch.zeros((n, 16), device=self.device)
+        tr_deltas = torch.zeros((n, 16), device=self.device)
         
         tr_idx = torch.nonzero(has_trader).squeeze(1)
         if tr_idx.numel() > 0:
             deltas = self.map_trader_deltas[tr_idx, py[tr_idx], px[tr_idx]] # (K, 4, 4)
-            tr_flat[tr_idx] = deltas.view(-1, 16).float()
+            tr_deltas[tr_idx] = deltas.view(-1, 16).float()
             
-        tr_flat = tr_flat * 0.1 # Scale
-        
-        # Prev Action One-Hot
-        pa_oh = torch.nn.functional.one_hot(self.prev_actions, num_classes=13).float() # (N, 13)
-
-        # Concatenate
-        return torch.cat([t_flat, i_flat, s_flat, tr_flat, pa_oh], dim=1)
-        
+        return encode_wss_obs_torch(
+            t_win,
+            i_win,
+            self.player_status,
+            tr_deltas,
+            self.prev_actions
+        )
