@@ -1,6 +1,33 @@
-import Items, Trader
+"""Player entity and resource management.
+
+The :class:`Player` tracks resources (strength, water, food, gold), holds a
+reference to the current :class:`src.Map.Map`, and provides helpers to collect
+items and trade with a :class:`src.Trader.Trader`.
+"""
+
+# Prefer package-relative imports; fall back to absolute for script mode
+try:  # pragma: no cover - import resolution shim
+    from . import Items, Trader  # type: ignore
+except Exception:  # pragma: no cover
+    import Items  # type: ignore
+    import Trader  # type: ignore
 
 class Player:
+    """Stateful player model used by the WSS.
+
+    Attributes
+    ----------
+    maxFood, maxWater, maxStrength : int
+        Maximum capacities for the three consumable resources.
+    currentGold, currentWater, currentFood : int
+        Current resource levels.
+    currentStrength : int
+        Current movement/strength points (separate from maxStrength).
+    position : tuple[int, int]
+        Current map coordinates ``(x, y)``.
+    map_reference : src.Map.Map | None
+        Reference to the attached map (set via :meth:`attach_map`).
+    """
     maxFood = maxWater = maxStrength = 0
     currentGold = currentWater = currentFood = 0
     position = (0, 0)
@@ -10,66 +37,89 @@ class Player:
         self.reset()
     
     def reset(self):
-        # global maxWater, maxFood, maxStrength, currentGold, currentWater, currentFood
+        """Reinitialize player stats and position.
+
+        Sets all maximums to 100, initializes current resources and strength,
+        and places the player at ``(0, 0)``.
+        """
         self.maxFood = self.maxWater = self.maxStrength = 100
         self.currentGold = 20
-        self.currentWater = 10
-        self.currentFood = 10
+        self.currentWater = 20
+        self.currentFood = 20
+        # track movement/strength points separately from max
+        self.currentStrength = self.maxStrength
         self.position = (0, 0)
 
     def attach_map(self, new_map):
-        map_reference = new_map
+        """Attach the current map to this player.
+
+        :param src.Map.Map new_map: Map instance to attach. This enables
+            other components (Vision/Brain/Env) to access the world via the
+            player.
+        """
+        self.map_reference = new_map
     
-    def bargain(trader): # returns 1 for sucessful trade, 0 for unsucessful
-        bargaining = True
-        while bargaining:
-            proposal = trader.getProposal()
-            print("trader wants:")
-            print(proposal[0])
-            print("for:")
-            print(proposal[1])
+    def execute_trade(self,
+                      trader,
+                      option_index: int
+                      ) -> bool:
+        """Execute a specific trade option from the trader.
 
-            user_input = input("do you accept the offer?: y/n \n")
-            if user_input == "y":
-                print("trade accepted")
-                Player.transfer(Player, proposal)
-                return 1 
-            elif user_input == "n":
-                user_input = input("do you want to propose a new offer?: y/n \n")
-                if user_input == "n":
-                    return 0 # transfer will not intiate
-                elif user_input == "y": # bartering begins
-                    user_input = input("Enter what you want in values in order of gold, water, food separated by spaces \n")
-                    recieving = [int(x) for x in user_input.split()]
-                    user_input = input("Enter what you will trade away in values in order of gold, water, food separated by spaces \n")
-                    offering = [int(x) for x in user_input.split()]
-                    
-                    result = trader.recieveProposal([offering, recieving])
-                    if result == 0: # trader accepts new offer
-                        print("trade accepted")
-                        Player.transfer(Player, [offering, recieving]) # intiate transfer
-                        return 1
-                    elif result == 1: # trader rejects new offer
-                        print("trader has rejected your offer, this is their new offer:")
-                    elif result == 2: # trader stops all trading
-                        print("trader is no longer willing to trade. trading session has ended")
-                        return 0
+        :param Trader.Trader trader: The trader instance.
+        :param int option_index: Index of the trade in trader's inventory (0-based).
+        :return: ``True`` if trade successful, ``False`` otherwise.
+        """
+        inventory = trader.getInventory()
+        if option_index < 0 or option_index >= len(inventory):
+            return False
 
-    def collect(self, item: Items): # only for collecting items
+        proposal = inventory[option_index]
+        # proposal: [trader_receives (what player pays), trader_offers]
+        wants = proposal[0]  # [gold, water, food]
+
+        if (self.currentGold >= wants[0] and
+            self.currentWater >= wants[1] and
+            self.currentFood >= wants[2]):
+
+            self.transfer(proposal)
+            return True
+        return False
+
+    def collect(self, item: Items):  # only for collecting items
+        """Collect the provided non-trader item into player's inventory.
+
+        Clamps water and food to their respective maximums. Gold has no max.
+
+        :param Items.Items item: Item to collect (water/food/gold).
+        """
         type, amount = item.getType(), item.getAmount()
         match type:
             case "water":
-                self.currentWater += amount
+                self.currentWater = min(self.maxWater, self.currentWater + amount)
             case "food":
-                self.currentFood += amount
+                self.currentFood = min(self.maxFood, self.currentFood + amount)
             case "gold":
                 self.currentGold += amount
 
-    def transfer(self, offer): # only for bargaining with trader
-        # global currentGold, currentWater, currentFood
+    def transfer(self, offer):  # only for bargaining with trader
+        """Apply a barter offer result to player's resources.
+
+        The offer uses the format ``[offering, receiving]`` with each side a
+        triplet ``[gold, water, food]``. Resources are updated accordingly and
+        clamped to valid ranges.
+
+        :param list offer: ``[[g_out, w_out, f_out], [g_in, w_in, f_in]]``
+            representing the final accepted offer.
+        """
         self.currentGold += (offer[1][0] - offer[0][0])
-        self.currentWater += (offer[1][1] - offer[0][1])
-        self.currentFood += (offer[1][2] - offer[0][2])
+        self.currentWater = max(0, min(self.maxWater, self.currentWater + (offer[1][1] - offer[0][1])))
+        self.currentFood = max(0, min(self.maxFood, self.currentFood + (offer[1][2] - offer[0][2])))
 
     def getResources(self):
+        """Return a human-readable summary of resources.
+
+        :return: Text summary including gold, water, and food.
+        :rtype: str
+        """
         return "gold:" + str(self.currentGold) + " water: " + str(self.currentWater) + " food: " + str(self.currentFood)
+

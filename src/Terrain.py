@@ -1,32 +1,86 @@
-# stores the different terrain types & their costs
-# each terrain has move cost, water cost & food cost
+"""Terrain definitions and difficulty-weighted random selection.
+
+This module defines the base ``Terrain`` class used by tiles and utilities to
+sample random terrain according to the current difficulty. Difficulties and
+their weights are provided by ``src.Difficulty`` when available.
+
+Public API
+----------
+- :class:`Terrain` — immutable-like container for terrain costs
+- :func:`random_terrain` — sample a terrain using difficulty-weighted choice
+"""
 
 import random
+# Try package-relative import first; fall back to absolute when run as a script
+try:  # pragma: no cover - import resolution shim
+    from . import Difficulty  # type: ignore
+except Exception:  # pragma: no cover
+    try:
+        import Difficulty  # type: ignore
+    except Exception:
+        Difficulty = None  # type: ignore
 
 class Terrain:
-    """
-    terrain object used by the map/tiles
+    """Terrain object used by the map/tiles.
 
-    name - string like "plains" or "forest"
-    move_cost - strength / movement cost to enter
-    water_cost - water cost to enter
-    food_cost - food cost to enter
+    Parameters
+    ----------
+    name : str
+        Human-readable terrain name (e.g., ``"plains"``, ``"forest"``).
+    move_cost : int
+        Strength/movement points required to enter the tile.
+    water_cost : int
+        Water units consumed on entering the tile.
+    food_cost : int
+        Food units consumed on entering the tile.
+
+    Notes
+    -----
+    Instances are lightweight data holders. All costs are applied when the
+    player enters the tile.
     """
 
-    def __init__(self, name, move_cost, water_cost, food_cost):
+    def __init__(self,
+                 name,
+                 move_cost,
+                 water_cost,
+                 food_cost
+                 ):
         self.name = name
         self.move_cost = move_cost
         self.water_cost = water_cost
         self.food_cost = food_cost
 
     def costs(self):
-        """return (move_cost, water_cost, food_cost)"""
+        """Get the cost tuple for entering this terrain.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            ``(move_cost, water_cost, food_cost)``.
+        """
         return self.move_cost, self.water_cost, self.food_cost
 
-    def can_enter(self, strength, water, food):
-        """
-        check if a player can enter this terrain
-        with the given resources
+    def can_enter(self,
+                  strength,
+                  water,
+                  food):
+        """Check if a player can enter this terrain with current resources.
+
+        Parameters
+        ----------
+        strength : int
+            Player's current strength/movement points.
+        water : int
+            Player's current water units.
+        food : int
+            Player's current food units.
+
+        Returns
+        -------
+        bool
+            ``True`` if the player has enough of each resource to pay costs on
+            entry; otherwise ``False``.
         """
         m, w, f = self.costs()
         return strength >= m and water >= w and food >= f
@@ -45,23 +99,34 @@ DESERT   = Terrain("desert",   move_cost=2, water_cost=4, food_cost=3)
 # list so we can randomly pick one
 TERRAIN_TYPES = [PLAINS, FOREST, SWAMP, MOUNTAIN, DESERT]
 
-# difficulty weights (same order as TERRAIN_TYPES)
-# bigger numbers = more likely
-_DIFFICULTY_WEIGHTS = {
-    "easy":    [6, 3, 1, 0, 0],  # mostly plains/forest
-    "normal":  [4, 3, 1, 1, 1],  # mix of everything
-    "hard":    [2, 2, 2, 2, 2],  # pretty even
-    "extreme": [1, 1, 3, 3, 3],  # lots of bad tiles
-}
-
 def random_terrain(difficulty="normal"):
-    """
-    pick a random Terrain based on difficulty
+    """Pick a random :class:`Terrain` based on difficulty.
 
-    difficulty: "easy", "normal", "hard", "extreme"
-    unknown difficulty falls back to "normal"
+    Parameters
+    ----------
+    difficulty : str, optional
+        Difficulty label in {``"easy"``, ``"medium"``, ``"hard"``,
+        ``"extreme"``}. The legacy alias ``"normal"`` is accepted and maps to
+        ``"medium"``. Unknown values fall back to ``"medium"``.
+
+    Returns
+    -------
+    Terrain
+        A newly instantiated terrain object (not one of the shared constants) so
+        tiles do not share identity.
     """
-    weights = _DIFFICULTY_WEIGHTS.get(difficulty, _DIFFICULTY_WEIGHTS["normal"])
+    if Difficulty is not None:  # type: ignore
+        weights = Difficulty.get_terrain_weights(difficulty)  # type: ignore
+    else:
+        # Fallback weights if Difficulty module is unavailable
+        fallback = {
+            "easy":    [6, 3, 1, 0, 0],
+            "medium":  [4, 3, 1, 1, 1],
+            "hard":    [2, 2, 2, 2, 2],
+            "extreme": [1, 1, 3, 3, 3],
+        }
+        key = difficulty if difficulty in fallback else ("medium" if difficulty != "easy" else "easy")
+        weights = fallback[key]
     base = random.choices(TERRAIN_TYPES, weights=weights, k=1)[0]
 
     # make a new Terrain so tiles don't all share the same object

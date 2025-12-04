@@ -1,81 +1,131 @@
-import random, Items
+"""Trader entity with difficulty-scaled bartering behavior.
+
+The :class:`Trader` is implemented as a specialized repeating item. It accepts
+offers in terms of gold, water, and food and may counter based on its leniency
+(``deviation``) and a maximum number of counter offers. Profiles and sampling
+are driven by :mod:`src.Difficulty`.
+"""
+
+import random
+
+# Prefer package-relative imports; fall back to absolute when run directly
+try:  # pragma: no cover - import resolution shim
+    from . import Items, Difficulty  # type: ignore
+except Exception:  # pragma: no cover
+    import Items  # type: ignore
+    try:
+        import Difficulty  # type: ignore
+    except Exception:
+        Difficulty = None
+
 
 class Trader(Items.Items):
-    deviation = maxCounters = totalCounters = proposal = 0
+    """A repeating item that represents a trader NPC.
 
-    def __init__(self, difficulty):
+    :param str difficulty: Difficulty label used to select a trader behavior
+        profile. In absence of :mod:`Difficulty`, sensible defaults are used.
+    :param random.Random rng: Optional RNG for reproducible proposal sampling.
+
+    :ivar float deviation: Acceptable deviation around the original offer.
+    :ivar int maxCounters: Maximum number of counter offers allowed.
+    :ivar int totalCounters: Number of counters made so far in this session.
+    :ivar list proposal: Current proposal ``[receiving, offering]`` with each
+        side a triplet ``[gold, water, food]``.
+    """
+
+    deviation = maxCounters = totalCounters = 0
+    proposal = None
+    _rng = None
+
+    def __init__(self,
+                 difficulty,
+                 tile_costs=(0, 0, 0),
+                 rng: random.Random | None = None
+                 ):
         super().__init__("trader", True, float("inf"))
-        # global deviation, maxCounters, proposal, totalCounters
-        rand_float = random.random()
+        self._rng = rng or random.Random()
+        self.tile_costs = tile_costs
+        self.difficulty_str = difficulty
 
-        match difficulty: # difficulty scaling for trader: extreme, hard, normal, easy
-            case "extreme":
-                if rand_float >= 0.2: #aggressive
-                    self.deviation = 0.5
-                elif rand_float >= 0.05: #assertive
-                    self.deviation = 1.0
-                else: #passive
-                    self.deviation = 1.5
-            case "hard":
-                if rand_float >= 0.66: #aggressive
-                    deviation = 0.5
-                elif rand_float >= 0.33: #assertive
-                    self.deviation = 1.0
-                else:
-                    self.deviation = 1.5
-            case "normal":
-                if rand_float >= 0.4: #passive
-                    self.deviation = 1.5
-                elif rand_float >= 0.1: #assertive
-                    self.deviation = 1.0
-                else: #aggressive
-                    self.deviation = 0.5
-            case "easy":
-                if rand_float >= 0.2: #passive
-                    self.deviation = 1.5
-                elif rand_float >= 0.05: #assertive
-                    self.deviation = 1.0
-                else: #aggressive
-                    self.deviation = 0.5
-        if self.deviation == 1.5: # setting up how many counter offers can be made
-            self.maxCounters = 4
-        elif self.deviation == 1.0:
+        # Resolve difficulty profile
+        if Difficulty is not None:
+            diff = Difficulty.canonicalize(difficulty)
+            profile = Difficulty.get_trader_profile(diff)
+            self.deviation = Difficulty.sample_deviation(self._rng, profile)
+            self.maxCounters = profile["max_counters"].get(self.deviation, 2)
+            self._total_range = profile.get("total_range", (2, 5))
+        else:
+            # Fallback defaults
+            self.deviation = 1.0
             self.maxCounters = 3
-        elif self.deviation == 0.5:
-            self.maxCounters = 1
+            self._total_range = (2, 5)
 
         self.totalCounters = 0
-        self.proposal = Trader.generateProposal()
+        self.inventory = [self._generate_proposal() for _ in range(4)]
 
-    def generateProposal():
-        total = temp = random.randint(2, 5)
-        recieving, offering = [None] * 3, [None] * 3
-        for i in range(2):
-            recieving[i] = random.randint(0, temp)
-            temp -= recieving[i]
-        recieving[2] = temp
-        temp = total
-        for i in range(2):
-            offering[i] = random.randint(0, temp)
-            temp -= offering[i]
-        offering[2] = temp
-        # print([recieving, offering])
-        return [recieving, offering] # trader is recieving x, for y
-
-    def getProposal(self):
-        return self.proposal
-    
-    def recieveProposal(self, counter): # 0 = accept, 1 = reject + new offer, 2 = reject + stop trading
-        if self.totalCounters == self.maxCounters:
-            return 2
+    def _generate_proposal(self):
+        """Generate a proposal that scales with tile costs and difficulty."""
+        # Calculate minimum viable amounts based on tile costs (move, water, food)
+        m_cost, w_cost, f_cost = self.tile_costs
         
-        recieving, offering = sum(counter[0]), sum(counter[1])
-        ogRecieve, ogOffer = sum(self.proposal[0]), sum(self.proposal[1])
-        if recieving > offering:
-            return 0
-        elif recieving >= ogRecieve - self.deviation and offering <= ogOffer + self.deviation:
-            return 0
-        else:
-            self.totalCounters += 1
-            self.proposal = Trader.generateProposal()
-            return 1
+        # Cost to trade (wait action): roughly half the entry cost (ceil)
+        w_trade = (w_cost + 1) // 2
+        f_trade = (f_cost + 1) // 2
+        
+        # Total needed to break even (enter + trade)
+        w_needed = w_cost + w_trade
+        f_needed = f_cost + f_trade
+        
+        # Use the max resource cost as the baseline for significant trade value
+        base_cost = max(w_needed, f_needed)
+        # Ensure at least 1 to avoid zero-trades
+        base_cost = max(1, base_cost)
+        
+        # 1. Determine Payment Amount (Keep relatively consistent with slight variance)
+        payment_qty = self._rng.randint(base_cost, int(base_cost * 1.5))
+        
+        # 2. Determine Multiplier (Offer vs Payment Ratio) based on Difficulty
+        d = self.difficulty_str.lower() if isinstance(self.difficulty_str, str) else "normal"
+        
+        if "easy" in d:
+            # Easy: Skewed towards high values (Mean >> 1.0)
+            mult = self._rng.triangular(1.2, 3.0, 2.8)
+        elif "hard" in d:
+            # Hard: Symmetric around profitable mean (e.g. 1.3)
+            mult = self._rng.triangular(0.8, 1.8, 1.3)
+        elif "extreme" in d:
+            # Extreme: Skewed towards low/unprofitable values (Mode near Min)
+            mult = self._rng.triangular(0.5, 1.5, 0.6)
+        else: # Medium/Normal
+            # Medium: Skewed high, but less extreme than Easy
+            mult = self._rng.triangular(0.9, 2.2, 1.8)
+
+        # 3. Calculate Offer Amount
+        offer_qty = int(payment_qty * mult)
+        # Ensure at least 1 (unless we really want 0? No, usually 1)
+        offer_qty = max(1, offer_qty)
+        
+        # 1. Decide what Trader OFFERS (0=Gold, 1=Water, 2=Food)
+        offer_type = self._rng.randint(0, 2)
+        
+        offering = [0, 0, 0]
+        offering[offer_type] = offer_qty
+        
+        # 2. Decide what the Trader WANTS (what player pays)
+        possible_wants = [0, 1, 2]
+        if offer_type in possible_wants:
+            possible_wants.remove(offer_type)
+            
+        want_type = self._rng.choice(possible_wants)
+        
+        wants = [0, 0, 0]
+        wants[want_type] = payment_qty
+        
+        return [wants, offering]
+
+    def getInventory(self):
+        """Return the current list of proposals (inventory).
+
+        :return: List of proposals, where each is ``[receiving, offering]``.
+        """
+        return self.inventory
